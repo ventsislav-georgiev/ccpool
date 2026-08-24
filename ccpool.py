@@ -187,6 +187,29 @@ ABBREV = {"5h": "five_hour", "7d": "seven_day",
           "7d-overage-included": "seven_day_overage_included"}
 PREFIX = "anthropic-ratelimit-unified-"
 
+# Display names: the binary reads seven_day_overage_included as "Fable 5 limit".
+LABEL = {"five_hour": "5h", "seven_day": "week", "seven_day_opus": "opus",
+         "seven_day_sonnet": "sonnet", "seven_day_overage_included": "fable"}
+RESET_SHOWN = ("five_hour", "seven_day")
+ORDER = {c: i for i, c in enumerate(
+    ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
+     "seven_day_overage_included"))}
+
+
+def fmt_reset(val) -> str:
+    """"(4h4m)" / "(1d18h)" -- time left, same shape the HUD prints."""
+    try:
+        left = int(float(val) - time.time())
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if left <= 0:
+        return "(now)"
+    d, rem = divmod(left, 86400)
+    h, m = divmod(rem // 60, 60)
+    if d:
+        return f"({d}d{h}h)"
+    return f"({h}h{m}m)" if h else f"({m}m)"
+
 
 def probe_limits(token: str) -> dict[str, dict] | None:
     """Ask Anthropic directly what this account's quota actually is.
@@ -416,28 +439,43 @@ def cmd_status(_args) -> int:
         print("no accounts")
         return 0
     bad = 0
+    rows = []                    # (name, [cell per claim], tail)
     for name, rec in accts.items():
         limits = probe_limits(rec.get("token", ""))
         if limits is None:
-            print(f"  {name:<24} UNREACHABLE -- token may be dead")
+            rows.append((name, [], "UNREACHABLE -- token may be dead"))
             bad += 1
             continue
         parts = []
-        for claim in sorted(limits):
+        for claim in sorted(limits, key=lambda c: ORDER.get(c, 99)):
             row = limits[claim]
+            label = LABEL.get(claim, claim)
+            reset = fmt_reset(row.get("reset")) if claim in RESET_SHOWN else ""
             util = row.get("utilization")
             try:
-                parts.append(f"{claim} {float(util):.0%}"
-                             + ("!" if row.get("status") == "rejected" else ""))
+                parts.append(f"{label}:{float(util):.0%}"
+                             + ("!" if row.get("status") == "rejected" else "")
+                             + reset)
             except (TypeError, ValueError):
-                parts.append(f"{claim} {row.get('status', '?')}")
+                parts.append(f"{label}:{row.get('status', '?')}{reset}")
         # The probe already paid for this answer -- record it, so an account
         # that is known to be full never costs a rejected request to discover.
         spent = exhausted_claims(limits)
         for claim, reset in spent.items():
             bench(name, claim, reset)
-        print(f"  {name:<24} {'  '.join(parts)}"
-              + (f"  [benched: {','.join(sorted(spent))}]" if spent else ""))
+        tail = (f"[benched: {','.join(LABEL.get(c, c) for c in sorted(spent))}]"
+                if spent else "")
+        rows.append((name, parts, tail))
+
+    # Column widths from the widest cell, so the ` | ` separators line up.
+    ncol = max((len(p) for _, p, _ in rows), default=0)
+    wide = [max((len(p[i]) for _, p, _ in rows if len(p) > i), default=0)
+            for i in range(ncol)]
+    namew = max(len(n) for n, _, _ in rows)
+    for name, parts, tail in rows:
+        cells = " | ".join(p.ljust(wide[i]) for i, p in enumerate(parts))
+        print(f"  {name:<{namew}}  {cells}{'  ' + tail if tail else ''}"
+              .rstrip())
     return 1 if bad else 0
 
 

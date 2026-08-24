@@ -14,6 +14,7 @@ Anything that gets one right by ignoring the other is not a fix.
 import http.server
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -60,6 +61,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "7d-status": "allowed",
             "7d-utilization": "0.12",
             "7d-reset": str(reset + 86400),
+            "7d-overage-included-status": "allowed",
+            "7d-overage-included-utilization": "0.34",
             "overage-status": "rejected",
             "overage-disabled-reason": "org_level_disabled",
             "representative-claim": "five_hour",
@@ -207,7 +210,11 @@ def main():
         r = ccpool("status", home=home7, api=api)
         check("status still reports both", "s-full" in r.stdout and "s-ok" in r.stdout,
               r.stdout)
-        check("the full one is flagged as benched", "[benched: five_hour]" in r.stdout,
+        check("fable percent is reported under its own name",
+              "fable:34%" in r.stdout, r.stdout)
+        check("5h and week carry their reset times",
+              len(re.findall(r"\(\d+[dhm]", r.stdout)) >= 2, r.stdout)
+        check("the full one is flagged as benched", "[benched: 5h]" in r.stdout,
               r.stdout)
         st = json.loads((home7 / "state.json").read_text())
         cd = st.get("accounts", {})
