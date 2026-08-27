@@ -539,15 +539,26 @@ def cmd_status(_args) -> int:
         spent = exhausted_claims(limits)
         for claim, reset in spent.items():
             bench(name, claim, reset)
-        tail = (f"[benched: {','.join(LABEL.get(c, c) for c in sorted(spent))}]"
-                if spent else "")
-        # Usable now sorts first; benched accounts follow in the order they
-        # come back, so the top row is always the one to reach for next.
-        key = (1, min(spent.values())) if spent else (0, 0)
+        # A hold (or a long Retry-After bench) is a cooldown the probe cannot
+        # rediscover -- the quota reads healthy. Without this the account looks
+        # available while the picker is skipping it.
+        held = {c: t for c, t in cooldowns(name).items()
+                if t > time.time() and c not in spent}
+        tail = " ".join(
+            p for p in (
+                f"[benched: {','.join(LABEL.get(c, c) for c in sorted(spent))}]"
+                if spent else "",
+                f"[held: {','.join(LABEL.get(c, c) for c in sorted(held))}"
+                f"{fmt_reset(min(held.values()))}]" if held else "")
+            if p)
+        # Usable now sorts first; the rest follow in the order they come back,
+        # so the top row is always the one to reach for next.
+        out = {**spent, **held}
+        key = (1, min(out.values())) if out else (0, 0)
         rows.append((name, parts, tail, key))
         record_resets(name, limits)
         live.append({"util": utils(limits), "reset": resets(limits),
-                     "spent": spent})
+                     "spent": out})
 
     rows.sort(key=lambda r: r[3])
 
