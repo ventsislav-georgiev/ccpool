@@ -548,8 +548,7 @@ def cmd_status(_args) -> int:
             p for p in (
                 f"[benched: {','.join(LABEL.get(c, c) for c in sorted(spent))}]"
                 if spent else "",
-                f"[held: {','.join(LABEL.get(c, c) for c in sorted(held))}"
-                f"{fmt_reset(min(held.values()))}]" if held else "")
+                f"[held: {fmt_reset(min(held.values()))[1:-1]}]" if held else "")
             if p)
         # Usable now sorts first; the rest follow in the order they come back,
         # so the top row is always the one to reach for next.

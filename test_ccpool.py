@@ -229,7 +229,7 @@ def main():
         ccpool("hold", "s-ok", home=home7, api=api)
         r = ccpool("status", home=home7, api=api)
         check("a hand-held account says so, and until when",
-              re.search(r"s-ok .*\[held: 5h\(\d+h\d+m\)\]", r.stdout), r.stdout)
+              re.search(r"s-ok .*\[held: \d+h\d+m\]", r.stdout), r.stdout)
         check("and it stops counting toward pool headroom",
               re.search(r"All .*5h:0%", r.stdout), r.stdout)
     finally:
