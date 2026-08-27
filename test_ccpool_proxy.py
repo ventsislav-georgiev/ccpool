@@ -32,6 +32,7 @@ FULL = set()         # token substrings that succeed but report 100% used
 SEEN = []            # tokens the upstream actually received, in order
 CONNS = []           # one entry per upstream TCP connection accepted
 BIG = set()          # token substrings that get a large body back
+LONGWAIT = set()     # 429 with healthy headers but a Retry-After hours away
 
 
 def check(name, cond, detail=""):
@@ -61,6 +62,7 @@ class Upstream(http.server.BaseHTTPRequestHandler):
 
         spent = any(f in auth for f in SPENT)
         overload = any(f in auth for f in OVERLOAD)
+        longwait = any(f in auth for f in LONGWAIT)
         full = any(f in auth for f in FULL)
         hdrs = {
             "5h-status": "rejected" if spent else "allowed",
@@ -70,16 +72,19 @@ class Upstream(http.server.BaseHTTPRequestHandler):
             "7d-reset": str(reset),
             "overage-status": "rejected",   # true on a healthy account
         }
-        if overload:
+        if overload or longwait:
             # Upstream congestion: a 429 with nothing actually exhausted.
             hdrs["5h-status"] = "allowed"
             hdrs["5h-utilization"] = "0.42"
 
-        body = (b'{"type":"error","error":{"message":"limit"}}' if (spent or overload)
+        limited = spent or overload or longwait
+        body = (b'{"type":"error","error":{"message":"limit"}}' if limited
                 else b'{"type":"message","content":[{"type":"text","text":"hi"}]}')
-        if any(f in auth for f in BIG) and not (spent or overload):
+        if any(f in auth for f in BIG) and not limited:
             body = b'{"type":"message","pad":"' + b"x" * 400000 + b'"}'
-        self.send_response(429 if (spent or overload) else 200)
+        self.send_response(429 if limited else 200)
+        if longwait:
+            self.send_header("Retry-After", "7200")
         for k, v in hdrs.items():
             self.send_header(f"anthropic-ratelimit-unified-{k}", v)
         self.send_header("content-type", "application/json")
@@ -228,6 +233,20 @@ def main():
               all(C.cooldowns(n) == before[n] for n in C.accounts()),
               {n: C.cooldowns(n) for n in C.accounts()})
         OVERLOAD.clear()
+
+        print("\nA 429 pointing hours away is exhaustion, whatever the headers say")
+        SPENT.clear(); SEEN.clear()
+        LONGWAIT.add("tok-three")
+        C.write_atomic(C.STATE, {"current": "three"})
+        status, body = post(port)
+        check("client still sees a 200", status == 200, f"{status} {body[:120]}")
+        check("the stalled account was tried first, then another",
+              len(SEEN) >= 2 and "tok-three" in SEEN[0]
+              and "tok-three" not in SEEN[-1], SEEN)
+        check("and it is benched on a claim the picker actually reads",
+              C.cooldowns("three").get("five_hour", 0) > time.time() + 3600,
+              C.cooldowns("three"))
+        LONGWAIT.clear()
 
         print("\nWhole pool exhausted is reported honestly")
         SPENT.update({"tok-one", "tok-two", "tok-three"})

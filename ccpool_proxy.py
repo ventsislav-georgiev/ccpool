@@ -180,6 +180,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.note(f"{name}: 429 not quota -- {detail}"
                               + (f"; retry-after={retry}" if retry else "")
                               + f"; body={snippet!r}")
+                    # A rate-limit 429 telling us to come back in over an hour
+                    # is exhaustion in everything but headers (seen live:
+                    # seven_day at 0.97 "allowed_warning", retry-after of two
+                    # days). Bench for exactly that long -- otherwise the
+                    # client hammers a dead account until reset. five_hour,
+                    # not a made-up claim: it is the one claim in every CLAIMS
+                    # tuple, so the picker actually skips the account (same
+                    # reasoning as `ccpool hold`).
+                    try:
+                        wait = int(retry or 0)
+                    except ValueError:
+                        wait = 0
+                    if wait > 3600:
+                        spent = {"five_hour": int(time.time()) + wait}
                 conn.close()
                 if spent:
                     with LOCK:
