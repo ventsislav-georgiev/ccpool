@@ -118,6 +118,30 @@ def bench(name: str, claim: str, until: int) -> None:
     write_atomic(STATE, st)
 
 
+def record_resets(name: str, limits: dict[str, dict]) -> None:
+    """Remember when each claim's window rolls over, for accounts that are not
+    benched -- `cooldown` only ever holds the claims that are already spent, and
+    rotation needs to know which healthy account expires soonest."""
+    fresh = {c: r for c, r in resets(limits).items() if r > time.time()}
+    if not fresh:
+        return
+    st = load(STATE)
+    rec = st.setdefault("accounts", {}).setdefault(name, {})
+    if rec.get("reset") == fresh:
+        return                       # unchanged for the whole window, no write
+    rec["reset"] = fresh
+    write_atomic(STATE, st)
+
+
+def reset_at(name: str, claim: str) -> float:
+    """The recorded rollover for `claim`, or +inf when we have never seen one --
+    an unseen window is a full window, which is exactly the account to leave for
+    later."""
+    r = load(STATE).get("accounts", {}).get(name, {}).get("reset", {}).get(claim)
+    now = time.time()
+    return float(r) if isinstance(r, (int, float)) and r > now else float("inf")
+
+
 def remember_last(name: str) -> None:
     """Persist the active account, so a restart resumes on the same one instead
     of moving to another organization and cold-starting its cache."""
@@ -162,14 +186,14 @@ def pick(model: str | None, exclude: set[str]) -> str | None:
     if current in names and current not in exclude and eligible(current, model, now):
         return current
 
-    # Current one is spent (or excluded after a rejection). Take the next in
-    # order and stay there.
-    start = names.index(current) + 1 if current in names else 0
-    for i in range(len(names)):
-        n = names[(start + i) % len(names)]
-        if n not in exclude and eligible(n, model, now):
-            return n
-    return None
+    # Current one is spent (or excluded after a rejection). Move to the account
+    # whose five-hour window rolls over soonest: that quota is the one about to
+    # be forfeited anyway, while an account with a fresh window keeps its full
+    # five hours for later. Accounts we have never measured sort last -- an
+    # unseen window is a whole window.
+    ready = [n for n in names if n not in exclude and eligible(n, model, now)]
+    ready.sort(key=lambda n: (reset_at(n, "five_hour"), names.index(n)))
+    return ready[0] if ready else None
 
 
 def next_reset(model: str | None) -> int | None:
@@ -431,6 +455,57 @@ def cmd_ls(_args) -> int:
     return 0
 
 
+def utils(limits: dict[str, dict]) -> dict[str, float]:
+    """{claim: utilization} for the claims that report a usable number."""
+    out = {}
+    for claim, row in limits.items():
+        with contextlib.suppress(TypeError, ValueError):
+            if row.get("utilization") is not None:
+                out[claim] = float(row["utilization"])
+    return out
+
+
+def resets(limits: dict[str, dict]) -> dict[str, int]:
+    out = {}
+    for claim, row in limits.items():
+        with contextlib.suppress(TypeError, ValueError):
+            out[claim] = int(float(row.get("reset")))
+    return out
+
+
+def headroom(live: list[dict], claim: str, at: float) -> float:
+    """Percent of one account's quota free across the pool, as it will stand at
+    epoch `at` -- claims whose reset has passed by then count as empty, and an
+    account still benched on anything at that moment contributes nothing."""
+    total = 0.0
+    for acct in live:
+        if any(r > at for r in acct["spent"].values()):
+            continue
+        if claim not in acct["util"]:
+            continue
+        spent = 0.0 if acct["reset"].get(claim, 0) <= at else acct["util"][claim]
+        total += max(0.0, 1.0 - spent)
+    return total
+
+
+def total_cells(live: list[dict]) -> list[str]:
+    """The `All` row: pool headroom now, and the next reset that grows it."""
+    claims = {c for a in live for c in a["util"]}
+    moments = sorted({r for a in live for r in a["reset"].values()
+                      if r > time.time()})
+    cells = []
+    for claim in sorted(claims, key=lambda c: ORDER.get(c, 99)):
+        now_free = headroom(live, claim, time.time())
+        cell = f"{LABEL.get(claim, claim)}:{now_free:.0%}"
+        for at in moments:
+            gain = headroom(live, claim, at) - now_free
+            if gain > 0.005:
+                cell += fmt_reset(at)
+                break
+        cells.append(cell)
+    return cells
+
+
 def cmd_status(_args) -> int:
     """Probe every account. Costs one tiny completion per account, against that
     account's own quota -- so this is a command you run, never a poll."""
@@ -439,11 +514,12 @@ def cmd_status(_args) -> int:
         print("no accounts")
         return 0
     bad = 0
-    rows = []                    # (name, [cell per claim], tail)
+    rows = []                    # (name, [cell per claim], tail, sortkey)
+    live = []                    # per-account {util, reset, spent} for the total
     for name, rec in accts.items():
         limits = probe_limits(rec.get("token", ""))
         if limits is None:
-            rows.append((name, [], "UNREACHABLE -- token may be dead"))
+            rows.append((name, [], "UNREACHABLE -- token may be dead", (2, 0)))
             bad += 1
             continue
         parts = []
@@ -465,14 +541,25 @@ def cmd_status(_args) -> int:
             bench(name, claim, reset)
         tail = (f"[benched: {','.join(LABEL.get(c, c) for c in sorted(spent))}]"
                 if spent else "")
-        rows.append((name, parts, tail))
+        # Usable now sorts first; benched accounts follow in the order they
+        # come back, so the top row is always the one to reach for next.
+        key = (1, min(spent.values())) if spent else (0, 0)
+        rows.append((name, parts, tail, key))
+        record_resets(name, limits)
+        live.append({"util": utils(limits), "reset": resets(limits),
+                     "spent": spent})
+
+    rows.sort(key=lambda r: r[3])
+
+    if live:
+        rows.append(("All", total_cells(live), "", (3, 0)))
 
     # Column widths from the widest cell, so the ` | ` separators line up.
-    ncol = max((len(p) for _, p, _ in rows), default=0)
-    wide = [max((len(p[i]) for _, p, _ in rows if len(p) > i), default=0)
+    ncol = max((len(p) for _, p, _, _ in rows), default=0)
+    wide = [max((len(p[i]) for _, p, _, _ in rows if len(p) > i), default=0)
             for i in range(ncol)]
-    namew = max(len(n) for n, _, _ in rows)
-    for name, parts, tail in rows:
+    namew = max(len(n) for n, _, _, _ in rows)
+    for name, parts, tail, _ in rows:
         cells = " | ".join(p.ljust(wide[i]) for i, p in enumerate(parts))
         print(f"  {name:<{namew}}  {cells}{'  ' + tail if tail else ''}"
               .rstrip())

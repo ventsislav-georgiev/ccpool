@@ -280,10 +280,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         zero wasted round trip.
         """
         spent = C.exhausted_claims(limits)
+        with LOCK:
+            C.record_resets(name, limits)
+            for claim, reset in spent.items():
+                C.bench(name, claim, reset)
         if spent:
-            with LOCK:
-                for claim, reset in spent.items():
-                    C.bench(name, claim, reset)
             self.note(f"{name} now full on {','.join(sorted(spent))} -- retired "
                       f"before it could reject anything")
 

@@ -220,7 +220,9 @@ def main():
         cd = st.get("accounts", {})
         check("and the cooldown is on disk, so no request pays to rediscover it",
               "five_hour" in cd.get("s-full", {}).get("cooldown", {}), st)
-        check("the healthy one is left alone", "s-ok" not in cd, st)
+        check("the healthy one is not benched, only its rollover recorded",
+              not cd.get("s-ok", {}).get("cooldown")
+              and "five_hour" in cd.get("s-ok", {}).get("reset", {}), st)
         check("the reset is Anthropic's, not a 15-minute guess",
               cd["s-full"]["cooldown"]["five_hour"] > time.time() + 1800, st)
     finally:
