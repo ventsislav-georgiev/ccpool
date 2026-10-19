@@ -4,6 +4,8 @@
     ccpool proxy                       # listens on 127.0.0.1:8790
     ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
 
+    ccpool launch                      # both: starts the proxy if it is down
+
 A running `claude` process reads its *environment* once, at startup, so
 ANTHROPIC_AUTH_TOKEN cannot rotate a live session. (It does re-read the keychain
 per request -- logging into a new account in one window visibly switches every
@@ -49,6 +51,10 @@ import ccpool as C  # noqa: E402
 import ccpool_watch as W  # noqa: E402
 
 UPSTREAM = os.environ.get("CCPOOL_UPSTREAM", "https://api.anthropic.com")
+# Answered by the proxy itself, never relayed: it is how `ccpool launch` tells
+# this proxy apart from anything else holding the port.
+HEALTH = "/ccpool/health"
+SERVICE = "ccpool-proxy"
 PREFIX = "anthropic-ratelimit-unified-"
 # Hop-by-hop headers, plus the ones we must own rather than forward.
 STRIP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -133,7 +139,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.relay()
 
     def do_GET(self):
+        if self.path == HEALTH:
+            return self.health()
         self.relay()
+
+    def health(self):
+        payload = json.dumps({"service": SERVICE, "pid": os.getpid()}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def relay(self):
         length = int(self.headers.get("content-length") or 0)
@@ -320,6 +336,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+
+def probe(port: int, host: str = "127.0.0.1", timeout: float = 5) -> dict | None:
+    """The health answer of the ccpool proxy on this port: None when nothing
+    listens, {} from a proxy too old to answer HEALTH itself.
+
+    Every ccpool proxy names itself in the first Server header, the old ones
+    too: they relay the path upstream, but send_response puts ours before
+    Anthropic's. Raises OSError when anything else answers, socket.timeout when
+    nothing answers in time. http.client rather than urllib, so an
+    HTTP(S)_PROXY in the environment is never asked. The default timeout is
+    long enough for an old proxy's round trip to Anthropic.
+    """
+    refused = OSError(f"port {port} is held by something that is not {SERVICE}")
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        try:
+            conn.request("GET", HEALTH)
+        except ConnectionRefusedError:
+            return None
+        resp = conn.getresponse()
+        raw = resp.read()
+        server = (resp.headers.get_all("server") or [""])[0]
+        if server.split(" ")[0] != Handler.server_version:
+            raise refused
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = None
+        return body if resp.status == 200 and isinstance(body, dict) else {}
+    except http.client.HTTPException as e:
+        raise refused from e
+    finally:
+        conn.close()
 
 
 def serve(host="127.0.0.1", port=8790):

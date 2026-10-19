@@ -262,6 +262,30 @@ def main():
         check("message names the pool, not a single account",
               "all pooled accounts" in body, body[:200])
         check("and says when it comes back", "reset" in body.lower(), body[:200])
+
+        print("\nThe health path is answered locally, never relayed")
+        SEEN.clear(); CONNS.clear()
+        health = P.probe(port)
+        check("it names the proxy and its pid",
+              health == {"service": "ccpool-proxy", "pid": os.getpid()}, health)
+        check("upstream never saw it", not SEEN and not CONNS, (SEEN, CONNS))
+
+        class Old(P.Handler):
+            do_GET = P.Handler.relay          # a proxy from before HEALTH
+        old = TServer(("127.0.0.1", 0), Old)
+        threading.Thread(target=old.serve_forever, daemon=True).start()
+        try:
+            check("a proxy from before HEALTH is still recognised",
+                  P.probe(old.server_port) == {}, "refused")
+        except OSError as e:
+            check("a proxy from before HEALTH is still recognised", False, e)
+        finally:
+            old.shutdown()
+        try:
+            P.probe(up.server_port)
+            check("something else on the port is refused", False, "no error")
+        except OSError:
+            check("something else on the port is refused", True)
     finally:
         px.shutdown(); up.shutdown()
         shutil.rmtree(home, ignore_errors=True)

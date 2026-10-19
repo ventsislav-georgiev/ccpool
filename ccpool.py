@@ -5,6 +5,8 @@
     ccpool ls
     ccpool clear work          # undo a bench; use `all` for the whole pool
     ccpool run -- -p "do the thing" --model opus
+    ccpool launch              # claude through the proxy, started if it is down
+    ccpool launch cmux -- claude-teams
 
 `run` picks an eligible account, runs Claude Code under it, and on a rate-limit
 rejection confirms with Anthropic before benching that account and retrying on
@@ -37,11 +39,13 @@ import argparse
 import contextlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -50,7 +54,9 @@ import ccpool_watch as W  # noqa: E402
 
 HOME = Path(os.environ.get("CCPOOL_HOME", Path.home() / ".ccpool"))
 VAULT, STATE = HOME / "vault.json", HOME / "state.json"
+PROXY_LOG = HOME / "proxy.log"
 CLAUDE = os.environ.get("CCPOOL_CLAUDE", "claude")
+PORT = 8790
 # Deliberately NOT ANTHROPIC_BASE_URL: the probe must not travel through
 # whatever proxy produced the 429 it is being asked to adjudicate.
 PROBE_BASE = os.environ.get("CCPOOL_PROBE_BASE", "https://api.anthropic.com")
@@ -656,6 +662,109 @@ def cmd_rm(args) -> int:
     return 0
 
 
+def cmd_launch(args) -> int:
+    """`ollama launch claude`, for the pool: run a tool pointed at the proxy,
+    starting the proxy first if nothing answers.
+
+    The proxy is started detached and outlives the session, the way the Ollama
+    server does. Every window then shares one proxy and one view of which
+    account is benched, and a second launch reuses it instead of dying on a
+    port the first one already bound.
+    """
+    import ccpool_proxy as P
+    if not accounts():
+        print("ccpool: no accounts. `ccpool add <name>` first.", file=sys.stderr)
+        return 2
+
+    # [TOOL] [-- ARGS], the shape `ollama launch` takes.
+    rest = args.rest
+    cut = rest.index("--") if "--" in rest else len(rest)
+    argv = (rest[:cut] or [CLAUDE]) + rest[cut + 1:]
+
+    try:
+        running = P.probe(args.port)
+    except OSError as e:
+        print(f"ccpool: {e}. Pass --port.", file=sys.stderr)
+        return 2
+    if running is None and not start_proxy(args.port):
+        return 1
+
+    env = dict(os.environ)
+    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{args.port}"
+    try:
+        os.execvpe(argv[0], argv, env)
+    except OSError as e:
+        print(f"ccpool: cannot run {argv[0]}: {e.strerror}", file=sys.stderr)
+        return 127
+
+
+def start_proxy(port: int) -> bool:
+    """Start `ccpool proxy` in a session of its own and wait until it answers.
+
+    Its output goes to PROXY_LOG, never to this terminal: the launched tool is
+    about to own it.
+    """
+    import ccpool_proxy as P
+    HOME.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with open(PROXY_LOG, "ab") as log:
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "proxy",
+             "--port", str(port)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        # Read the exit before probing. A launch racing this one can bind the
+        # port first; this child then dies on it while the winner serves.
+        exited = proc.poll() is not None
+        try:
+            if P.probe(port) is not None:
+                return True
+        except OSError:
+            pass
+        if exited:
+            break
+        time.sleep(0.1)
+    print(f"ccpool: proxy did not come up on port {port}; see {PROXY_LOG}",
+          file=sys.stderr)
+    return False
+
+
+def cmd_statusline(_args) -> int:
+    """A Claude Code status-line segment: `ccpool <account>` while this
+    session's traffic reaches a ccpool proxy, `ccpool down` when the local port
+    it points at does not answer, nothing when the session goes anywhere else.
+
+    A status-line command inherits the session's environment, so the URLs read
+    here are the session's own. Behind headroom, ANTHROPIC_BASE_URL is
+    headroom's port and ANTHROPIC_TARGET_API_URL is the hop that has to be
+    ccpool, so that one wins when it is set. The port is probed rather than
+    merely connected to: anything else listening there, headroom included,
+    must not read as the pool.
+    """
+    import ccpool_proxy as P
+    try:
+        url = urllib.parse.urlsplit(os.environ.get("ANTHROPIC_TARGET_API_URL")
+                                    or os.environ.get("ANTHROPIC_BASE_URL", ""))
+        host, port = url.hostname, url.port or 80
+    except ValueError:
+        return 0  # a URL that does not parse is not our proxy
+    if url.scheme != "http" or host not in ("127.0.0.1", "localhost"):
+        return 0
+    try:
+        running = P.probe(port, host, timeout=1)
+    except socket.timeout:
+        running = None  # it accepts but never answers: no request gets through
+    except OSError:
+        return 0
+    if running is None:
+        print("\033[31mccpool down\033[0m", end="")
+        return 0
+    current = load(STATE).get("current")
+    print("\033[32mccpool\033[0m" + (f" {current}" if current else ""), end="")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="ccpool", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -667,8 +776,18 @@ def main(argv=None) -> int:
     p.set_defaults(fn=cmd_ls)
 
     p = sub.add_parser("proxy", help="rotate accounts under a live session")
-    p.add_argument("--port", type=int, default=8790)
+    p.add_argument("--port", type=int, default=PORT)
     p.set_defaults(fn=lambda a: __import__("ccpool_proxy").serve(port=a.port))
+
+    p = sub.add_parser("launch", help="run claude (or TOOL) through the proxy, "
+                                      "starting the proxy if it is down")
+    p.add_argument("--port", type=int, default=PORT)
+    p.add_argument("rest", nargs=argparse.REMAINDER, metavar="[TOOL] [-- ARGS]")
+    p.set_defaults(fn=cmd_launch)
+
+    p = sub.add_parser("statusline", help="status-line segment: is this session "
+                                          "going through the proxy")
+    p.set_defaults(fn=cmd_statusline)
 
     p = sub.add_parser("status", help="probe every account's real quota (costs a call each)")
     p.set_defaults(fn=cmd_status)

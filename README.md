@@ -44,6 +44,36 @@ ccpool proxy &
 ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
 ```
 
+`ccpool launch` does the live-session setup in one step, the way
+`ollama launch claude` does for Ollama. It starts the proxy if nothing answers on
+the port, then runs `claude` with `ANTHROPIC_BASE_URL` pointed at it:
+
+```sh
+ccpool launch                          # claude
+ccpool launch -- --model opus          # args after -- go to claude
+ccpool launch cmux -- claude-teams     # any other tool
+```
+
+The proxy runs detached and keeps running after the session ends, so later
+launches and other windows share it. Its output goes to `~/.ccpool/proxy.log`.
+If the port is held by something that is not a ccpool proxy, `launch` refuses
+rather than sending your session to it.
+
+`ccpool statusline` tells you which sessions go through the pool. It prints
+`ccpool <account>` while the session's `ANTHROPIC_BASE_URL` answers as a ccpool
+proxy, `ccpool down` when nothing answers on that local port, and nothing when
+the session goes anywhere else. Behind headroom it reads
+`ANTHROPIC_TARGET_API_URL` instead, the hop that has to be ccpool. Use it as the
+status line, or call it from your own status-line script:
+
+```json
+"statusLine": { "type": "command", "command": "ccpool statusline" }
+```
+
+It runs on every status refresh, so give it an interpreter that starts fast: a
+pyenv shim adds about 0.3s, `/usr/bin/python3 ~/.local/bin/ccpool statusline`
+does not.
+
 Other commands: `status` (probe real quota, costs one call per account), `hold`
 (pull an account out of rotation), `clear` (undo a bench), `rm`.
 
