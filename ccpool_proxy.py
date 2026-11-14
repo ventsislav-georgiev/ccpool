@@ -63,14 +63,17 @@ STRIP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization"
 LOCK = threading.Lock()
 
 # Conversation -> (account, last request). Claude Code tags every request with
-# its session id, and a subagent's with its agent id too; each of those is its
-# own prompt, so its own cache, and can live on any account without costing the
-# others theirs. Unpinned conversations follow C.pick() as before -- one account
-# serves everything, which is what keeps the cache warm. A conversation moves
-# only when its account throttles it, and then stays where it moved.
+# its session id, and a subagent's with its agent id too. Each SESSION gets an
+# account of its own, and its subagents follow it there: the prompt cache is
+# per organization, so when an account runs out only the sessions on it move
+# and cold-start, not every live one at once. That was ~8% of all usage when
+# one account served everything (session-tokens, Nov 10-14). Requests without
+# a session id (`ccpool run`, other clients) still follow C.pick().
 PINS: dict[str, tuple[str, float]] = {}
+UTIL: dict[str, float] = {}   # account -> five_hour utilization last reported
 PIN_IDLE = 3600     # the longest prompt-cache TTL: after that there is nothing to keep
-BUSY = 300          # "active on an account", for spreading the ones that move
+BUSY = 300          # "active on an account", for counting its sessions
+FULLISH = 0.9       # a new session placed here would only have to move again soon
 
 
 def conversation(headers) -> str | None:
@@ -78,38 +81,81 @@ def conversation(headers) -> str | None:
     return f"{sid}/{headers.get('x-claude-code-agent-id', '')}" if sid else None
 
 
-def choose(key: str | None, model: str | None, tried: set[str]) -> str | None:
-    """Caller holds LOCK. The account this conversation is pinned to while it
-    can still serve the model, else whatever C.pick() says."""
+def load_pins() -> None:
+    """Pins outlive a restart: without them every live session would be
+    re-placed, mostly onto another account, and cold-start at once."""
     now = time.time()
-    for k in [k for k, (_, seen) in PINS.items() if now - seen > PIN_IDLE]:
-        del PINS[k]
-    pinned = PINS.get(key, (None, 0))[0] if key else None
-    if pinned in C.accounts() and pinned not in tried and C.eligible(pinned, model, now):
-        name = pinned
+    for key, acct in C.load(C.STATE).get("pins", {}).items():
+        PINS[key] = (acct, now)
+
+
+def save_pins() -> None:
+    """Caller holds LOCK. The mapping only, on change -- not on every request."""
+    st = C.load(C.STATE)
+    st["pins"] = {k: acct for k, (acct, _) in PINS.items()}
+    C.write_atomic(C.STATE, st)
+
+
+def pin(key: str, name: str | None) -> None:
+    """Caller holds LOCK. Point a conversation at an account (None unpins it)."""
+    before = PINS.get(key, (None, 0))[0]
+    if name:
+        PINS[key] = (name, time.time())
     else:
+        PINS.pop(key, None)
+    if before != name:
+        save_pins()
+
+
+def choose(key: str | None, model: str | None, tried: set[str]) -> str | None:
+    """Caller holds LOCK. The conversation's own account, else its session's,
+    else a fresh placement -- each only while it can still serve the model."""
+    now = time.time()
+    stale = [k for k, (_, seen) in PINS.items() if now - seen > PIN_IDLE]
+    for k in stale:
+        del PINS[k]
+    if stale:
+        save_pins()
+    if not key:
         name = C.pick(model, tried)
         if name:
-            # Only the default path moves `current`: a moved conversation must
-            # not drag every new one after it.
             C.remember_last(name)
-    if key and name:
-        PINS[key] = (name, now)
+        return name
+
+    def ok(n):
+        return n in C.accounts() and n not in tried and C.eligible(n, model, now)
+
+    sid = key.split("/", 1)[0] + "/"
+    own = PINS.get(key, (None, 0))[0]
+    # The session's main conversation first, then whichever sibling ran last:
+    # a session that just moved pulls its subagents after it.
+    siblings = sorted(((k == sid, seen, acct) for k, (acct, seen) in PINS.items()
+                       if k.startswith(sid) and k != key), reverse=True)
+    name = next((n for n in [own] + [a for _, _, a in siblings] if n and ok(n)), None)
+    if name is None:
+        name = place(model, tried)
+        if name:
+            C.remember_last(name)      # `current` is the latest placement
+    if name:
+        pin(key, name)
     return name
 
 
-def spill(model: str | None, tried: set[str]) -> str | None:
-    """Caller holds LOCK. Where a throttled conversation goes: the eligible
-    account with the fewest conversations active on it, so a fan-out of
-    subagents spreads instead of piling onto the next account in line."""
+def place(model: str | None, tried: set[str]) -> str | None:
+    """Caller holds LOCK. Where a new or moving session goes: the eligible
+    account with the fewest sessions active on it, skipping nearly full ones
+    while any other is free, then the five-hour window that rolls over soonest
+    (that quota is forfeit first)."""
     now = time.time()
-    load: dict[str, int] = {}
-    for acct, seen in PINS.values():
+    load: dict[str, set] = {}
+    for k, (acct, seen) in PINS.items():
         if now - seen < BUSY:
-            load[acct] = load.get(acct, 0) + 1
+            load.setdefault(acct, set()).add(k.split("/", 1)[0])
     names = list(C.accounts())
     ready = [n for n in names if n not in tried and C.eligible(n, model, now)]
-    return min(ready, key=lambda n: (load.get(n, 0), C.reset_at(n, "five_hour"),
+    return min(ready, key=lambda n: (UTIL.get(n, 0) >= FULLISH,
+                                     len(load.get(n, ())),
+                                     C.reset_at(n, "five_hour"),
                                      names.index(n)), default=None)
 
 # Idle upstream connections, per account. Without this every request pays a
@@ -209,7 +255,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         fwd = {k: v for k, v in self.headers.items() if k.lower() not in STRIP}
         tried: set[str] = set()
         key = conversation(self.headers)
-        moved = False
+        moved, back = False, None
 
         for _ in range(max(1, len(C.accounts()))):
             with LOCK:
@@ -227,6 +273,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.fail(502, "upstream unreachable")
 
             limits = record_utilization(name, headers)
+            try:
+                UTIL[name] = float(limits["five_hour"]["utilization"])
+            except (KeyError, TypeError, ValueError):
+                pass
 
             if status == 429:
                 spent = C.exhausted_claims(limits)
@@ -275,14 +325,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # each client retry into one upstream call per account.
                 if key and not moved:
                     with LOCK:
-                        dest = spill(model, tried)
+                        back = PINS.get(key, (None, 0))[0]
+                        dest = place(model, tried)
                         if dest:
-                            PINS[key] = (dest, time.time())
+                            pin(key, dest)
                     if dest:
                         self.note(f"{name}: throttled -- moving conversation "
                                   f"{key[:8]} to {dest}")
                         moved = True
                         continue
+                elif moved:
+                    # Refused there too: the move bought nothing, so the
+                    # conversation goes back to where its cache is.
+                    with LOCK:
+                        pin(key, back)
                 return self.fail(429, "upstream rate limit (not account quota)")
 
             # Retire before streaming, not after: the body can take a minute to
@@ -439,6 +495,7 @@ def probe(port: int, host: str = "127.0.0.1", timeout: float = 5) -> dict | None
 def serve(host="127.0.0.1", port=8790):
     if not C.accounts():
         sys.exit("ccpool: no accounts. `ccpool add <name>` first.")
+    load_pins()
     srv = Server((host, port), Handler)
     print(f"ccpool-proxy on http://{host}:{port} -> {UPSTREAM}\n"
           f"  {len(C.accounts())} accounts. Point Claude Code at it:\n"

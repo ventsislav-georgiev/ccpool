@@ -236,34 +236,66 @@ def main():
         check("nobody gets benched for it",
               all(C.cooldowns(n) == before[n] for n in C.accounts()),
               {n: C.cooldowns(n) for n in C.accounts()})
-        SEEN.clear()
-        status, body = post(port, session="s-all")
-        check("a conversation throttled everywhere gets the same 429",
-              status == 429 and "not account quota" in body, f"{status} {body[:160]}")
-        check("after one move, not a walk of the whole pool", len(SEEN) == 2, SEEN)
         OVERLOAD.clear()
 
-        print("\nA throttled conversation moves, and stays where it moved")
-        SPENT.clear(); SEEN.clear(); P.PINS.clear()
-        C.write_atomic(C.STATE, {"current": "one"})
+        print("\nEach session gets an account of its own")
+        def fresh():
+            SPENT.clear(); OVERLOAD.clear(); FULL.clear(); SEEN.clear()
+            P.PINS.clear(); P.UTIL.clear()
+            C.write_atomic(C.STATE, {"current": "one"})
+        def via(session, agent=None):
+            SEEN.clear()
+            status, _ = post(port, session=session, agent=agent)
+            return status, SEEN[-1].removeprefix("Bearer tok-") if SEEN else None
+        fresh()
+        a, b, c = via("a")[1], via("b")[1], via("c")[1]
+        check("three sessions land on three accounts", len({a, b, c}) == 3, (a, b, c))
+        check("a session's subagent joins it there", via("a", "sub")[1] == a)
+        check("and the session stays put", via("a")[1] == a)
+        check("headerless requests still follow `current`", post(port)[0] == 200
+              and SEEN[-1] == f"Bearer tok-{C.load(C.STATE)['current']}", SEEN)
+        check("pins are saved", C.load(C.STATE).get("pins", {}).get("a/") == a,
+              C.load(C.STATE).get("pins"))
+        P.PINS.clear(); P.load_pins()
+        check("and survive a restart", via("b")[1] == b)
+
+        SPENT.add(f"tok-{a}")
+        status, a2 = via("a")
+        check("when its account runs out, the session moves", status == 200
+              and a2 != a, a2)
+        check("its subagent follows it, not a fresh placement",
+              via("a", "sub")[1] == a2)
+        check("other sessions are not moved", via("b")[1] == b and via("c")[1] == c)
+
+        fresh()
+        P.UTIL.update({"one": 0.95})
+        check("a new session skips a nearly full account", via("n")[1] != "one")
+        P.UTIL.update({"two": 0.95, "three": 0.95})
+        check("unless every account is nearly full", via("m")[1] is not None)
+
+        print("\nA throttled conversation moves once, and back if that did not help")
+        fresh()
+        P.PINS["heavy/"] = ("one", time.time())
         OVERLOAD.add("tok-one")
+        SEEN.clear()
         status, _ = post(port, session="heavy")
         moved = SEEN[-1]
         check("it is served by another account", status == 200
               and "tok-one" in SEEN[0] and "tok-one" not in moved, SEEN)
-        status, _ = post(port, session="heavy", agent="sub-1")
-        check("a second throttled conversation spreads to the other one",
-              status == 200 and SEEN[-1] not in (moved, SEEN[0]), SEEN)
         OVERLOAD.clear(); SEEN.clear()
         post(port, session="heavy")
         check("once moved, it goes straight there -- its cache lives there",
               SEEN == [moved], SEEN)
-        post(port, session="light")
-        check("everything else still starts on the current account",
-              len(SEEN) == 2 and "tok-one" in SEEN[-1], SEEN)
-        check("and `current` was not dragged along by the move",
-              C.load(C.STATE).get("current") == "one", C.load(C.STATE))
-        P.PINS.clear()
+        fresh()
+        P.PINS["stuck/"] = ("one", time.time())
+        OVERLOAD.update({"tok-one", "tok-two", "tok-three"})
+        status, body = post(port, session="stuck")
+        check("throttled everywhere: the same 429", status == 429
+              and "not account quota" in body, f"{status} {body[:160]}")
+        check("after one move, not a walk of the whole pool", len(SEEN) == 2, SEEN)
+        check("and it is pinned back where its cache is",
+              P.PINS.get("stuck/", ("?",))[0] == "one", P.PINS)
+        fresh()
 
         print("\nA long Fable Retry-After does not hold Opus")
         SPENT.clear(); SEEN.clear()
