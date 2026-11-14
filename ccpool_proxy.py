@@ -72,7 +72,6 @@ LOCK = threading.Lock()
 PINS: dict[str, tuple[str, float]] = {}
 UTIL: dict[str, float] = {}   # account -> five_hour utilization last reported
 PIN_IDLE = 3600     # the longest prompt-cache TTL: after that there is nothing to keep
-BUSY = 300          # "active on an account", for counting its sessions
 FULLISH = 0.9       # a new session placed here would only have to move again soon
 
 
@@ -143,14 +142,14 @@ def choose(key: str | None, model: str | None, tried: set[str]) -> str | None:
 
 def place(model: str | None, tried: set[str]) -> str | None:
     """Caller holds LOCK. Where a new or moving session goes: the eligible
-    account with the fewest sessions active on it, skipping nearly full ones
+    account holding the fewest live sessions (pinned within the hour, so one
+    idle on its user still counts -- its cache is warm), skipping nearly full ones
     while any other is free, then the five-hour window that rolls over soonest
     (that quota is forfeit first)."""
     now = time.time()
     load: dict[str, set] = {}
-    for k, (acct, seen) in PINS.items():
-        if now - seen < BUSY:
-            load.setdefault(acct, set()).add(k.split("/", 1)[0])
+    for k, (acct, _) in PINS.items():
+        load.setdefault(acct, set()).add(k.split("/", 1)[0])
     names = list(C.accounts())
     ready = [n for n in names if n not in tried and C.eligible(n, model, now)]
     return min(ready, key=lambda n: (UTIL.get(n, 0) >= FULLISH,

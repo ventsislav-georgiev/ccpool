@@ -268,6 +268,10 @@ def main():
         check("other sessions are not moved", via("b")[1] == b and via("c")[1] == c)
 
         fresh()
+        P.PINS["idle/"] = ("one", time.time() - 600)
+        check("a session idle on its user still holds its account",
+              via("new")[1] != "one")
+        fresh()
         P.UTIL.update({"one": 0.95})
         check("a new session skips a nearly full account", via("n")[1] != "one")
         P.UTIL.update({"two": 0.95, "three": 0.95})
