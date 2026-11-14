@@ -8,6 +8,7 @@ underneath it, and a normal 200 comes back.
 A fake upstream stands in for api.anthropic.com and decides per-token whether to
 429, so a rotation is only possible if the credential really changed.
 """
+import gzip
 import http.server
 import json
 import os
@@ -33,6 +34,19 @@ SEEN = []            # tokens the upstream actually received, in order
 CONNS = []           # one entry per upstream TCP connection accepted
 BIG = set()          # token substrings that get a large body back
 LONGWAIT = set()     # 429 with healthy headers but a Retry-After hours away
+STREAM = set()       # token substrings answered with an SSE stream
+GZIP = set()         # token substrings whose body comes gzip-encoded
+SSE = b"".join(b"event: %s\ndata: %s\n\n" % (e, json.dumps(d).encode()) for e, d in [
+    (b"message_start", {"type": "message_start", "message": {"usage": {
+        "input_tokens": 10, "cache_creation_input_tokens": 200,
+        "cache_read_input_tokens": 5000, "output_tokens": 1,
+        "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                           "ephemeral_1h_input_tokens": 200}}}}),
+    # padding past the relay's 8 KB reads, so events straddle chunks
+    *[(b"content_block_delta", {"type": "content_block_delta",
+                                "delta": {"text": "x" * 3000}})] * 5,
+    (b"message_delta", {"type": "message_delta", "usage": {"output_tokens": 42}}),
+    (b"message_stop", {"type": "message_stop"})])
 
 
 def check(name, cond, detail=""):
@@ -79,15 +93,24 @@ class Upstream(http.server.BaseHTTPRequestHandler):
 
         limited = spent or overload or longwait
         body = (b'{"type":"error","error":{"message":"limit"}}' if limited
-                else b'{"type":"message","content":[{"type":"text","text":"hi"}]}')
+                else b'{"type":"message","content":[{"type":"text","text":"hi"}],'
+                     b'"usage":{"input_tokens":3,"output_tokens":1}}')
         if any(f in auth for f in BIG) and not limited:
             body = b'{"type":"message","pad":"' + b"x" * 400000 + b'"}'
+        ctype = "application/json"
+        if not limited and any(f in auth for f in STREAM):
+            body, ctype = SSE, "text/event-stream"
+        zipped = not limited and any(f in auth for f in GZIP)
+        if zipped:
+            body = gzip.compress(body, mtime=0)
         self.send_response(429 if limited else 200)
+        if zipped:
+            self.send_header("content-encoding", "gzip")
         if longwait:
             self.send_header("Retry-After", "7200")
         for k, v in hdrs.items():
             self.send_header(f"anthropic-ratelimit-unified-{k}", v)
-        self.send_header("content-type", "application/json")
+        self.send_header("content-type", ctype)
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -103,7 +126,7 @@ class TServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         pass
 
 
-def post(port, payload=None, session=None, agent=None):
+def post(port, payload=None, session=None, agent=None, raw=False):
     headers = {"content-type": "application/json",
                "authorization": "Bearer client-token-should-be-replaced"}
     if session:
@@ -116,7 +139,8 @@ def post(port, payload=None, session=None, agent=None):
         headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, r.read().decode()
+            data = r.read()
+            return r.status, data if raw else data.decode()
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
 
@@ -224,6 +248,41 @@ def main():
         check("not spliced with the abandoned one",
               json.loads(body).get("content", [{}])[0].get("text") == "hi",
               body[:200])
+
+        print("\nEvery response leaves a usage row, its bytes untouched")
+        log = home / "usage.jsonl"
+        def count():
+            return len(log.read_text().splitlines()) if log.exists() else 0
+        def last(after):
+            # The row is written once the client has its last byte, so it can
+            # land a moment after post() returns.
+            deadline = time.time() + 3
+            while count() <= after and time.time() < deadline:
+                time.sleep(0.01)
+            return json.loads(log.read_text().splitlines()[-1])
+        SPENT.clear(); SEEN.clear(); P.PINS.clear()
+        n = count(); post(port, session="u")
+        r = last(n)
+        check("a JSON response's usage is logged",
+              r["usage"] == {"input_tokens": 3, "output_tokens": 1}
+              and r["conv"] == "u/" and r["model"] == "claude-opus-5"
+              and r["limits"]["five_hour"]["utilization"] == "0.42"
+              and r["complete"] and r["status"] == 200, r)
+        full = {"input_tokens": 10, "cache_creation_input_tokens": 200,
+                "cache_read_input_tokens": 5000, "output_tokens": 42,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                                   "ephemeral_1h_input_tokens": 200}}
+        STREAM.update({"tok-one", "tok-two", "tok-three"})
+        n = count(); status, body = post(port, session="u", raw=True)
+        check("a stream reaches the client byte for byte", body == SSE, body[:120])
+        check("its usage is read off message_start and message_delta",
+              last(n)["usage"] == full, last(n)["usage"])
+        GZIP.update({"tok-one", "tok-two", "tok-three"})
+        n = count(); status, body = post(port, session="u", raw=True)
+        check("a gzip stream is relayed still compressed",
+              body == gzip.compress(SSE, mtime=0), body[:40])
+        check("and its usage is still read", last(n)["usage"] == full, last(n)["usage"])
+        STREAM.clear(); GZIP.clear()
 
         print("\nUpstream congestion is not an account problem")
         SPENT.clear(); OVERLOAD.clear()

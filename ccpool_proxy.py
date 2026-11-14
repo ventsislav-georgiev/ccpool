@@ -44,6 +44,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -56,6 +57,11 @@ UPSTREAM = os.environ.get("CCPOOL_UPSTREAM", "https://api.anthropic.com")
 HEALTH = "/ccpool/health"
 SERVICE = "ccpool-proxy"
 PREFIX = "anthropic-ratelimit-unified-"
+# ~/.ccpool/usage.jsonl gets one JSON line per relayed response: account, model,
+# conversation, every claim's utilization and reset, and the response's usage.
+# Enough to fit what each kind of token really costs against the limits.
+# shortcut: grows ~10 MB/day and is never rotated; add rotation if that bites.
+USAGE_LOCK = threading.Lock()
 # Hop-by-hop headers, plus the ones we must own rather than forward.
 STRIP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
          "te", "trailers", "transfer-encoding", "upgrade", "host",
@@ -217,6 +223,63 @@ def record_utilization(name: str, headers) -> dict[str, dict]:
     return limits
 
 
+class UsageTap:
+    """Reads `usage` off a response body as it is relayed. Strictly passive:
+    it is handed the bytes after they are written, never alters them, and
+    never raises -- anything it cannot read leaves the row without usage."""
+
+    def __init__(self, headers):
+        enc = (headers.get("content-encoding") or "identity").lower()
+        self.inflate = (zlib.decompressobj(16 + zlib.MAX_WBITS) if enc == "gzip"
+                        else zlib.decompressobj() if enc == "deflate" else None)
+        self.dead = enc not in ("identity", "gzip", "deflate")
+        self.sse = "event-stream" in (headers.get("content-type") or "")
+        self.buf = b""
+        self.usage: dict = {}
+
+    def feed(self, chunk: bytes) -> None:
+        if self.dead:
+            return
+        try:
+            if self.inflate:
+                chunk = self.inflate.decompress(chunk)
+            self.buf += chunk
+            if not self.sse:
+                if len(self.buf) > 4 << 20:
+                    self.dead, self.buf = True, b""
+                return
+            # message_start carries input and cache usage, message_delta the
+            # final cumulative counts; later values win.
+            *lines, self.buf = self.buf.split(b"\n")
+            for line in lines:
+                if line.startswith(b"data:") and b'"usage"' in line:
+                    self.take(json.loads(line[5:]))
+        except Exception:  # noqa: BLE001
+            self.dead = True
+
+    def take(self, event: dict) -> None:
+        u = event.get("usage") or (event.get("message") or {}).get("usage")
+        if isinstance(u, dict):
+            self.usage.update({k: v for k, v in u.items() if v is not None})
+
+    def result(self) -> dict | None:
+        if not self.dead and not self.sse and self.buf:
+            try:
+                self.take(json.loads(self.buf))
+            except Exception:  # noqa: BLE001
+                pass
+        return self.usage or None
+
+
+def log_usage(row: dict) -> None:
+    try:
+        line = json.dumps(row, separators=(",", ":")) + "\n"
+        with USAGE_LOCK, open(C.HOME / "usage.jsonl", "a") as fh:
+            fh.write(line)
+    except Exception:  # noqa: BLE001
+        pass                     # a diagnostic must never fail a request
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "ccpool"
@@ -250,6 +313,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length") or 0)
         body = self.rfile.read(length) if length else b""
         model = self.model_of(body)
+        started = time.time()
 
         fwd = {k: v for k, v in self.headers.items() if k.lower() not in STRIP}
         tried: set[str] = set()
@@ -344,7 +408,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # drain, and a request arriving in that window would otherwise pick
             # an account already known to be empty.
             self.retire_if_full(name, limits)
-            self.stream_down(status, headers, resp, conn, name)
+            self.stream_down(status, headers, resp, conn, name, {
+                "acct": name, "model": model, "conv": key, "path": self.path,
+                "status": status, "limits": limits, "t0": started})
             return
 
         self.no_accounts(model)
@@ -370,9 +436,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not (reused and was_pooled):
                     raise    # a brand new connection failing is a real error
 
-    def stream_down(self, status, headers, resp, conn, name):
+    def stream_down(self, status, headers, resp, conn, name, row=None):
         """Past this point nothing may be retried -- bytes are on the wire."""
         done = False
+        tap = UsageTap(headers)
         try:
             self.send_response(status)
             for k, v in headers.items():
@@ -389,6 +456,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     break
                 self.wfile.write(b"%X\r\n%s\r\n" % (len(chunk), chunk))
                 self.wfile.flush()
+                tap.feed(chunk)
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
             done = True
@@ -403,6 +471,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 checkin(name, conn)
             else:
                 conn.close()
+            if row is not None:
+                t0 = row.pop("t0")
+                log_usage({"t": round(time.time(), 3), **row,
+                           "ms": round((time.time() - t0) * 1000),
+                           "complete": done, "usage": tap.result()})
 
     def retire_if_full(self, name, limits):
         """Bench an account the moment a SUCCESSFUL response says it is full.
