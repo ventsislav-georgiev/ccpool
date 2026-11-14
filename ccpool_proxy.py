@@ -390,7 +390,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def relay(self):
         length = int(self.headers.get("content-length") or 0)
         body = self.rfile.read(length) if length else b""
-        model = self.model_of(body)
+        req = self.parse(body)
+        model = req.get("model")
+        # A 1-token request is a quota check (Claude Code sends one, ~300 bytes,
+        # from processes that never send real work). Every throttle seen on one
+        # failed again after every retry and on any other account, and nothing
+        # waits on it -- pass its 429 straight back.
+        probe = req.get("max_tokens") == 1
         started = time.time()
 
         fwd = {k: v for k, v in self.headers.items() if k.lower() not in STRIP}
@@ -465,7 +471,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # all 8 in 2s), and walking the pool would turn each client
                 # retry into one upstream call per account.
                 throttles += 1
-                if waits and not moved:
+                if waits and not moved and not probe:
                     step = waits.pop(0)
                     delay = wait if 0 < wait <= 10 else step
                     self.note(f"{name}: throttled -- retrying "
@@ -473,7 +479,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     time.sleep(delay)
                     tried.discard(name)
                     continue
-                if key and not moved:
+                if key and not moved and not probe:
                     with LOCK:
                         back = PINS.get(key, (None, 0))[0]
                         dest = place(model, tried)
@@ -606,16 +612,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        - {k for k in (h.lower() for h in headers.keys())
                           if k.startswith(PREFIX)})
         return (f"speed={req.get('speed', 'standard')}; bytes={len(body)}; "
+                f"max_tokens={req.get('max_tokens', '-')}; "
                 f"effort={(req.get('output_config') or {}).get('effort', '-')}; "
                 f"beta={self.headers.get('anthropic-beta', '-')}; "
                 f"should-retry={headers.get('x-should-retry', '-')}; "
                 f"resp-headers={','.join(extra) or '-'}")
 
-    def model_of(self, body):
+    def parse(self, body) -> dict:
         try:
-            return json.loads(body).get("model")
+            req = json.loads(body)
+            return req if isinstance(req, dict) else {}
         except Exception:  # noqa: BLE001
-            return None
+            return {}
 
     def no_accounts(self, model):
         with LOCK:

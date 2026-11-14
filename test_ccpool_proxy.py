@@ -414,6 +414,12 @@ def main():
               and SEEN[-1] != "Bearer tok-one", SEEN)
         check("and it is pinned back where its cache is",
               P.PINS.get("stuck/", ("?",))[0] == "one", P.PINS)
+        SEEN.clear()
+        status, _ = post(port, {"model": "claude-opus-5", "max_tokens": 1},
+                         session="stuck")
+        check("a 1-token quota check is answered at once: no retry, no move",
+              status == 429 and len(SEEN) == 1
+              and P.PINS["stuck/"][0] == "one", SEEN)
         fresh()
 
         print("\nA long Fable Retry-After does not hold Opus")
