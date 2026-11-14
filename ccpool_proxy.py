@@ -76,9 +76,7 @@ LOCK = threading.Lock()
 # one account served everything (session-tokens, Nov 10-14). Requests without
 # a session id (`ccpool run`, other clients) still follow C.pick().
 PINS: dict[str, tuple[str, float]] = {}
-UTIL: dict[str, float] = {}   # account -> five_hour utilization last reported
 PIN_IDLE = 3600     # the longest prompt-cache TTL: after that there is nothing to keep
-FULLISH = 0.9       # a new session placed here would only have to move again soon
 BACKOFF = (1, 2, 4)  # seconds between same-account retries of a throttled request
 
 
@@ -149,20 +147,96 @@ def choose(key: str | None, model: str | None, tried: set[str]) -> str | None:
 
 def place(model: str | None, tried: set[str]) -> str | None:
     """Caller holds LOCK. Where a new or moving session goes: the eligible
-    account holding the fewest live sessions (pinned within the hour, so one
-    idle on its user still counts -- its cache is warm), skipping nearly full ones
-    while any other is free, then the five-hour window that rolls over soonest
-    (that quota is forfeit first)."""
+    account with the most five-hour headroom per live session on it --
+    (1 - utilization) x capacity / (sessions + 1). Plans differ up to 12x in
+    capacity, so a session on a small one would run it out and move (cold
+    cache) far sooner. Live = pinned within the hour: a session idle on its
+    user still holds a warm cache. Ties: the window that rolls over soonest."""
     now = time.time()
     load: dict[str, set] = {}
     for k, (acct, _) in PINS.items():
         load.setdefault(acct, set()).add(k.split("/", 1)[0])
     names = list(C.accounts())
     ready = [n for n in names if n not in tried and C.eligible(n, model, now)]
-    return min(ready, key=lambda n: (UTIL.get(n, 0) >= FULLISH,
-                                     len(load.get(n, ())),
+    return min(ready, key=lambda n: (-(1 - util_now(n, now)) * capacity(n)
+                                     / (len(load.get(n, ())) + 1),
                                      C.reset_at(n, "five_hour"),
                                      names.index(n)), default=None)
+
+
+# --- capacity: what one point of five-hour utilization buys, per account ------
+# List price, $ per million tokens: input, output, cache read. Cache writes are
+# 1.25x input (5 min) and 2x (1 hour). A proxy for what the limit charges, not
+# the limit's own weights -- those are unpublished; this only has to rank plans.
+PRICES = {"fable": (8, 40, 0.2), "mythos": (8, 40, 0.2), "opus": (4, 20, 0.2),
+          "sonnet": (2, 10, 0.1), "haiku": (0.1, 0.5, 0.01)}
+CAP: dict[str, list] = {}    # account -> [dollars, points] over observed steps
+STEP: dict[str, list] = {}   # account -> [window reset, utilization, dollars since it last rose]
+MIN_POINTS = 0.05            # below this an account's estimate is noise
+
+
+def dollars(model: str | None, u: dict) -> float:
+    fam = next((f for f in PRICES if model and f in model), "opus")
+    inp, out, read = PRICES[fam]
+    cc = u.get("cache_creation") or {}
+    w5 = cc.get("ephemeral_5m_input_tokens", u.get("cache_creation_input_tokens", 0) or 0)
+    w1 = cc.get("ephemeral_1h_input_tokens", 0)
+    return ((u.get("input_tokens") or 0) * inp + (w5 or 0) * inp * 1.25
+            + (w1 or 0) * inp * 2 + (u.get("cache_read_input_tokens") or 0) * read
+            + (u.get("output_tokens") or 0) * out) / 1e6
+
+
+def learn(acct: str, model: str | None, limits: dict, usage: dict | None) -> None:
+    """Caller holds LOCK. Utilization comes in whole points (2 decimals), so
+    the spend between two rises is what one rise cost; summed over many rises
+    that is the account's capacity. A new window or a drop starts over."""
+    try:
+        fh = limits["five_hour"]
+        util, reset = float(fh["utilization"]), float(fh["reset"])
+    except (KeyError, TypeError, ValueError):
+        return
+    st = STEP.get(acct)
+    if not st or st[0] != reset or util < st[1]:
+        STEP[acct] = [reset, util, 0.0]
+        return
+    st[2] += dollars(model, usage) if usage else 0.0
+    if util > st[1]:
+        c = CAP.setdefault(acct, [0.0, 0.0])
+        c[0] += st[2]
+        c[1] += util - st[1]
+        st[1], st[2] = util, 0.0
+
+
+def util_now(acct: str, now: float) -> float:
+    st = STEP.get(acct)
+    return st[1] if st and st[0] > now else 0.0   # a rolled-over window is empty
+
+
+def capacity(acct: str) -> float:
+    """$ per point; an account without enough data counts as the median."""
+    known = sorted(d / p for d, p in CAP.values() if p >= MIN_POINTS)
+    d, p = CAP.get(acct, (0.0, 0.0))
+    if p >= MIN_POINTS:
+        return d / p
+    return known[len(known) // 2] if known else 1.0
+
+
+def load_usage(days: float = 7) -> None:
+    """Relearn capacity and current utilization from usage.jsonl at startup.
+    shortcut: reads the whole file; bound it (seek to the tail) if it grows big."""
+    since = time.time() - days * 86400
+    try:
+        with open(C.HOME / "usage.jsonl") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                    if row.get("t", 0) >= since:
+                        learn(row["acct"], row.get("model"), row.get("limits") or {},
+                              row.get("usage"))
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    continue
+    except OSError:
+        pass
 
 # Idle upstream connections, per account. Without this every request pays a
 # fresh TLS handshake to api.anthropic.com -- ~100-300ms on a call whose whole
@@ -338,10 +412,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.fail(502, "upstream unreachable")
 
             limits = record_utilization(name, headers)
-            try:
-                UTIL[name] = float(limits["five_hour"]["utilization"])
-            except (KeyError, TypeError, ValueError):
-                pass
 
             if status == 429:
                 spent = C.exhausted_claims(limits)
@@ -489,9 +559,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.close()
             if row is not None:
                 t0 = row.pop("t0")
+                usage = tap.result()
+                with LOCK:
+                    learn(name, row.get("model"), row.get("limits") or {}, usage)
                 log_usage({"t": round(time.time(), 3), **row,
                            "ms": round((time.time() - t0) * 1000),
-                           "complete": done, "usage": tap.result()})
+                           "complete": done, "usage": usage})
 
     def retire_if_full(self, name, limits):
         """Bench an account the moment a SUCCESSFUL response says it is full.
@@ -584,6 +657,7 @@ def serve(host="127.0.0.1", port=8790):
     if not C.accounts():
         sys.exit("ccpool: no accounts. `ccpool add <name>` first.")
     load_pins()
+    load_usage()
     srv = Server((host, port), Handler)
     print(f"ccpool-proxy on http://{host}:{port} -> {UPSTREAM}\n"
           f"  {len(C.accounts())} accounts. Point Claude Code at it:\n"

@@ -306,7 +306,7 @@ def main():
         print("\nEach session gets an account of its own")
         def fresh():
             SPENT.clear(); OVERLOAD.clear(); FULL.clear(); SEEN.clear()
-            P.PINS.clear(); P.UTIL.clear()
+            P.PINS.clear(); P.STEP.clear(); P.CAP.clear()
             C.write_atomic(C.STATE, {"current": "one"})
         def via(session, agent=None):
             SEEN.clear()
@@ -337,10 +337,45 @@ def main():
         check("a session idle on its user still holds its account",
               via("new")[1] != "one")
         fresh()
-        P.UTIL.update({"one": 0.95})
+        later = time.time() + 3600
+        P.STEP["one"] = [later, 0.95, 0.0]
         check("a new session skips a nearly full account", via("n")[1] != "one")
-        P.UTIL.update({"two": 0.95, "three": 0.95})
+        P.STEP.update({"two": [later, 0.95, 0.0], "three": [later, 0.95, 0.0]})
         check("unless every account is nearly full", via("m")[1] is not None)
+
+        print("\nBigger plans take more sessions")
+        def feed(acct, dollars_per_point, points=6):
+            # Opus output at $20/MTok: 50k tokens is $1.
+            u = {"output_tokens": round(50000 * dollars_per_point / 100)}
+            for i in range(points + 1):
+                lim = {"five_hour": {"utilization": f"{0.10 + i / 100:.2f}",
+                                     "reset": str(later)}}
+                P.learn(acct, "claude-opus-5-5", lim, u)
+        fresh()
+        feed("one", 2.4); feed("two", 0.2)
+        check("capacity is learned from spend per point of utilization",
+              abs(P.capacity("one") / P.capacity("two") - 12) < 0.01,
+              (P.capacity("one"), P.capacity("two")))
+        check("an account without enough data counts as the median",
+              P.capacity("three") == P.capacity("one"), P.capacity("three"))
+        P.STEP.update({"one": [later, 0.30, 0.0], "two": [later, 0.0, 0.0],
+                       "three": [later, 0.90, 0.0]})
+        check("a new session goes to the bigger plan, even part used",
+              via("big")[1] == "one")
+        P.PINS["x/"] = ("three", time.time())
+        check("the small plan is last while a bigger one has headroom",
+              via("next")[1] != "two" and via("third")[1] != "two")
+        with open(home / "usage.jsonl", "a") as fh:
+            for i in range(7):
+                fh.write(json.dumps({"t": time.time(), "acct": "two", "model": "claude-opus-5-5",
+                    "limits": {"five_hour": {"utilization": f"{0.2 + i / 100:.2f}",
+                                             "reset": str(later)}},
+                    "usage": {"output_tokens": 500}}) + "\n")
+        P.CAP.clear(); P.STEP.clear(); P.load_usage()
+        check("and it is relearned from usage.jsonl at startup",
+              P.CAP.get("two", [0, 0])[1] >= 0.05
+              and abs(P.capacity("two") - 1.0) < 0.01, P.CAP)
+        fresh()
 
         print("\nA throttled conversation moves once, and back if that did not help")
         fresh()
