@@ -420,6 +420,11 @@ def main():
         check("a 1-token quota check is answered at once: no retry, no move",
               status == 429 and len(SEEN) == 1
               and P.PINS["stuck/"][0] == "one", SEEN)
+        OVERLOAD.clear()
+        status, _ = post(port, {"model": "claude-opus-5", "max_tokens": 1},
+                         session="checker")
+        check("a session that only checks quota is never pinned",
+              status == 200 and "checker/" not in P.PINS, P.PINS)
         fresh()
 
         print("\nA long Fable Retry-After does not hold Opus")

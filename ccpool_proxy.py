@@ -111,9 +111,11 @@ def pin(key: str, name: str | None) -> None:
         save_pins()
 
 
-def choose(key: str | None, model: str | None, tried: set[str]) -> str | None:
+def choose(key: str | None, model: str | None, tried: set[str],
+           stick: bool = True) -> str | None:
     """Caller holds LOCK. The conversation's own account, else its session's,
-    else a fresh placement -- each only while it can still serve the model."""
+    else a fresh placement -- each only while it can still serve the model.
+    stick=False follows a pin but never makes one."""
     now = time.time()
     stale = [k for k, (_, seen) in PINS.items() if now - seen > PIN_IDLE]
     for k in stale:
@@ -140,7 +142,7 @@ def choose(key: str | None, model: str | None, tried: set[str]) -> str | None:
         name = place(model, tried)
         if name:
             C.remember_last(name)      # `current` is the latest placement
-    if name:
+    if name and (stick or key in PINS):
         pin(key, name)
     return name
 
@@ -407,7 +409,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         for _ in range(max(1, len(C.accounts())) + len(BACKOFF)):
             with LOCK:
-                name = choose(key, model, tried)
+                # A quota check would otherwise pin a session that never works and
+                # count against its account in place() for an hour.
+                name = choose(key, model, tried, stick=not probe)
             if name is None:
                 return self.no_accounts(model)
             tried.add(name)
