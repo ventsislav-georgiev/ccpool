@@ -442,7 +442,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         spent = {claim: int(time.time()) + wait}
                         reason = "long Retry-After for requested model"
                     else:
-                        reason += f"; body={snippet!r}"
+                        reason += (f"; body={snippet!r}; "
+                                   f"{self.request_facts(body, headers)}")
                 chosen = ",".join(sorted(spent)) if spent else "none"
                 self.note(f"{name}: 429 model={model!r}; quota={detail}; "
                           f"retry-after={retry or '?'}; cooldown={chosen}; "
@@ -586,6 +587,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if spent:
             self.note(f"{name} now full on {','.join(sorted(spent))} -- retired "
                       f"before it could reject anything")
+
+    # Response headers every reply carries; the rest are what a throttle adds.
+    ROUTINE = {"date", "content-type", "content-length", "connection", "server",
+               "request-id", "cf-ray", "via", "cf-cache-status", "x-robots-tag",
+               "strict-transport-security", "anthropic-organization-id",
+               "x-envoy-upstream-service-time", "retry-after"}
+
+    def request_facts(self, body, headers) -> str:
+        """What a throughput 429's request looked like, to find what those
+        requests share: every one so far came from a short-lived session that
+        no retry or other account ever served."""
+        try:
+            req = json.loads(body)
+        except Exception:  # noqa: BLE001
+            req = {}
+        extra = sorted({k.lower() for k in headers.keys()} - self.ROUTINE
+                       - {k for k in (h.lower() for h in headers.keys())
+                          if k.startswith(PREFIX)})
+        return (f"speed={req.get('speed', 'standard')}; bytes={len(body)}; "
+                f"effort={(req.get('output_config') or {}).get('effort', '-')}; "
+                f"beta={self.headers.get('anthropic-beta', '-')}; "
+                f"should-retry={headers.get('x-should-retry', '-')}; "
+                f"resp-headers={','.join(extra) or '-'}")
 
     def model_of(self, body):
         try:
