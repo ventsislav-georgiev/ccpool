@@ -103,13 +103,17 @@ class TServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         pass
 
 
-def post(port, payload=None):
+def post(port, payload=None, session=None, agent=None):
+    headers = {"content-type": "application/json",
+               "authorization": "Bearer client-token-should-be-replaced"}
+    if session:
+        headers["x-claude-code-session-id"] = session
+    if agent:
+        headers["x-claude-code-agent-id"] = agent
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/messages",
         data=json.dumps(payload or {"model": "claude-opus-5"}).encode(),
-        headers={"content-type": "application/json",
-                 "authorization": "Bearer client-token-should-be-replaced"},
-        method="POST")
+        headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.status, r.read().decode()
@@ -232,7 +236,32 @@ def main():
         check("nobody gets benched for it",
               all(C.cooldowns(n) == before[n] for n in C.accounts()),
               {n: C.cooldowns(n) for n in C.accounts()})
+        status, body = post(port, session="s-all")
+        check("a throttled conversation with nowhere to go gets the same 429",
+              status == 429 and "not account quota" in body, f"{status} {body[:160]}")
         OVERLOAD.clear()
+
+        print("\nA throttled conversation moves, and stays where it moved")
+        SPENT.clear(); SEEN.clear(); P.PINS.clear()
+        C.write_atomic(C.STATE, {"current": "one"})
+        OVERLOAD.add("tok-one")
+        status, _ = post(port, session="heavy")
+        moved = SEEN[-1]
+        check("it is served by another account", status == 200
+              and "tok-one" in SEEN[0] and "tok-one" not in moved, SEEN)
+        status, _ = post(port, session="heavy", agent="sub-1")
+        check("a second throttled conversation spreads to the other one",
+              status == 200 and SEEN[-1] not in (moved, SEEN[0]), SEEN)
+        OVERLOAD.clear(); SEEN.clear()
+        post(port, session="heavy")
+        check("once moved, it goes straight there -- its cache lives there",
+              SEEN == [moved], SEEN)
+        post(port, session="light")
+        check("everything else still starts on the current account",
+              len(SEEN) == 2 and "tok-one" in SEEN[-1], SEEN)
+        check("and `current` was not dragged along by the move",
+              C.load(C.STATE).get("current") == "one", C.load(C.STATE))
+        P.PINS.clear()
 
         print("\nA long Fable Retry-After does not hold Opus")
         SPENT.clear(); SEEN.clear()

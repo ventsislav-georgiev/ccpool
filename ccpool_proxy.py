@@ -62,11 +62,61 @@ STRIP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization"
          "authorization", "x-api-key", "content-length"}
 LOCK = threading.Lock()
 
+# Conversation -> (account, last request). Claude Code tags every request with
+# its session id, and a subagent's with its agent id too; each of those is its
+# own prompt, so its own cache, and can live on any account without costing the
+# others theirs. Unpinned conversations follow C.pick() as before -- one account
+# serves everything, which is what keeps the cache warm. A conversation moves
+# only when its account throttles it, and then stays where it moved.
+PINS: dict[str, tuple[str, float]] = {}
+PIN_IDLE = 3600     # the longest prompt-cache TTL: after that there is nothing to keep
+BUSY = 300          # "active on an account", for spreading the ones that move
+
+
+def conversation(headers) -> str | None:
+    sid = headers.get("x-claude-code-session-id")
+    return f"{sid}/{headers.get('x-claude-code-agent-id', '')}" if sid else None
+
+
+def choose(key: str | None, model: str | None, tried: set[str]) -> str | None:
+    """Caller holds LOCK. The account this conversation is pinned to while it
+    can still serve the model, else whatever C.pick() says."""
+    now = time.time()
+    for k in [k for k, (_, seen) in PINS.items() if now - seen > PIN_IDLE]:
+        del PINS[k]
+    pinned = PINS.get(key, (None, 0))[0] if key else None
+    if pinned in C.accounts() and pinned not in tried and C.eligible(pinned, model, now):
+        name = pinned
+    else:
+        name = C.pick(model, tried)
+        if name:
+            # Only the default path moves `current`: a moved conversation must
+            # not drag every new one after it.
+            C.remember_last(name)
+    if key and name:
+        PINS[key] = (name, now)
+    return name
+
+
+def spill(model: str | None, tried: set[str]) -> str | None:
+    """Caller holds LOCK. Where a throttled conversation goes: the eligible
+    account with the fewest conversations active on it, so a fan-out of
+    subagents spreads instead of piling onto the next account in line."""
+    now = time.time()
+    load: dict[str, int] = {}
+    for acct, seen in PINS.values():
+        if now - seen < BUSY:
+            load[acct] = load.get(acct, 0) + 1
+    names = list(C.accounts())
+    ready = [n for n in names if n not in tried and C.eligible(n, model, now)]
+    return min(ready, key=lambda n: (load.get(n, 0), C.reset_at(n, "five_hour"),
+                                     names.index(n)), default=None)
+
 # Idle upstream connections, per account. Without this every request pays a
 # fresh TLS handshake to api.anthropic.com -- ~100-300ms on a call whose whole
 # round trip is under a second. Keyed by account rather than shared, so a
-# rotation never hands one org's connection to another; there is one active
-# account at a time anyway, so the pool stays warm regardless.
+# rotation never hands one org's connection to another. Most traffic is on one
+# account; the few moved conversations keep their own account's pool warm.
 POOL: dict[str, list] = {}
 POOL_LOCK = threading.Lock()
 POOL_MAX = 8
@@ -158,10 +208,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         fwd = {k: v for k, v in self.headers.items() if k.lower() not in STRIP}
         tried: set[str] = set()
+        key = conversation(self.headers)
 
         for _ in range(max(1, len(C.accounts()))):
             with LOCK:
-                name = C.pick(model, tried)
+                name = choose(key, model, tried)
             if name is None:
                 return self.no_accounts(model)
             tried.add(name)
@@ -175,8 +226,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.fail(502, "upstream unreachable")
 
             limits = record_utilization(name, headers)
-            with LOCK:
-                C.remember_last(name)
 
             if status == 429:
                 spent = C.exhausted_claims(limits)
@@ -217,8 +266,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.note(f"{name} out on {','.join(sorted(spent))} -- "
                               f"rotating to another account and retrying request")
                     continue
-                # A 429 carrying no spent claim is upstream load, not quota.
-                # Rotating would not help and benching would be a lie.
+                # No spent claim: a throughput limit, and a per-account one --
+                # in the log 98% of these bursts stay on a single account. So
+                # nothing is benched, but the conversation that hit it moves to
+                # the least busy account and stays there. Busy conversations
+                # hit it most, so they are the ones that move.
+                if key:
+                    with LOCK:
+                        dest = spill(model, tried)
+                        if dest:
+                            PINS[key] = (dest, time.time())
+                    if dest:
+                        self.note(f"{name}: throttled -- moving conversation "
+                                  f"{key[:8]} to {dest}")
+                        continue
                 return self.fail(429, "upstream rate limit (not account quota)")
 
             # Retire before streaming, not after: the body can take a minute to
