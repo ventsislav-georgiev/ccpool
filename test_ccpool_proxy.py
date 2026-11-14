@@ -236,9 +236,11 @@ def main():
         check("nobody gets benched for it",
               all(C.cooldowns(n) == before[n] for n in C.accounts()),
               {n: C.cooldowns(n) for n in C.accounts()})
+        SEEN.clear()
         status, body = post(port, session="s-all")
-        check("a throttled conversation with nowhere to go gets the same 429",
+        check("a conversation throttled everywhere gets the same 429",
               status == 429 and "not account quota" in body, f"{status} {body[:160]}")
+        check("after one move, not a walk of the whole pool", len(SEEN) == 2, SEEN)
         OVERLOAD.clear()
 
         print("\nA throttled conversation moves, and stays where it moved")

@@ -209,6 +209,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         fwd = {k: v for k, v in self.headers.items() if k.lower() not in STRIP}
         tried: set[str] = set()
         key = conversation(self.headers)
+        moved = False
 
         for _ in range(max(1, len(C.accounts()))):
             with LOCK:
@@ -266,12 +267,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.note(f"{name} out on {','.join(sorted(spent))} -- "
                               f"rotating to another account and retrying request")
                     continue
-                # No spent claim: a throughput limit, and a per-account one --
-                # in the log 98% of these bursts stay on a single account. So
-                # nothing is benched, but the conversation that hit it moves to
-                # the least busy account and stays there. Busy conversations
-                # hit it most, so they are the ones that move.
-                if key:
+                # No spent claim: a throughput limit. Nothing is benched, but the
+                # conversation that hit it moves to the least busy account and
+                # stays there. Once per request only: a second account refusing
+                # too means the limit is not this account's (one conversation
+                # was refused by all 8 in 2s), and walking the pool would turn
+                # each client retry into one upstream call per account.
+                if key and not moved:
                     with LOCK:
                         dest = spill(model, tried)
                         if dest:
@@ -279,6 +281,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if dest:
                         self.note(f"{name}: throttled -- moving conversation "
                                   f"{key[:8]} to {dest}")
+                        moved = True
                         continue
                 return self.fail(429, "upstream rate limit (not account quota)")
 
