@@ -356,6 +356,12 @@ def main():
         check("capacity is learned from spend per point of utilization",
               abs(P.capacity("one") / P.capacity("two") - 12) < 0.01,
               (P.capacity("one"), P.capacity("two")))
+        CAP_ONE = list(P.CAP["one"])
+        for u in ("0.15", "0.14", "0.15", "0.14", "0.15"):   # concurrent wobble
+            P.learn("one", "claude-opus-5-5",
+                    {"five_hour": {"utilization": u, "reset": str(later)}}, {})
+        check("a wobble below the window's maximum adds no points",
+              P.CAP["one"] == CAP_ONE, (P.CAP["one"], CAP_ONE))
         check("an account without enough data counts as the median",
               P.capacity("three") == P.capacity("one"), P.capacity("three"))
         P.STEP.update({"one": [later, 0.30, 0.0], "two": [later, 0.0, 0.0],

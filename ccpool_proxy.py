@@ -171,7 +171,7 @@ def place(model: str | None, tried: set[str]) -> str | None:
 PRICES = {"fable": (8, 40, 0.2), "mythos": (8, 40, 0.2), "opus": (4, 20, 0.2),
           "sonnet": (2, 10, 0.1), "haiku": (0.1, 0.5, 0.01)}
 CAP: dict[str, list] = {}    # account -> [dollars, points] over observed steps
-STEP: dict[str, list] = {}   # account -> [window reset, utilization, dollars since it last rose]
+STEP: dict[str, list] = {}   # account -> [window reset, max utilization, dollars since it rose]
 MIN_POINTS = 0.05            # below this an account's estimate is noise
 
 
@@ -189,15 +189,18 @@ def dollars(model: str | None, u: dict) -> float:
 def learn(acct: str, model: str | None, limits: dict, usage: dict | None) -> None:
     """Caller holds LOCK. Utilization comes in whole points (2 decimals), so
     the spend between two rises is what one rise cost; summed over many rises
-    that is the account's capacity. A new window or a drop starts over."""
+    that is the account's capacity. Only rises of the window's running maximum
+    count: the header is stamped when a request starts and the row when it
+    ends, so concurrent requests make the series wobble (.34 .35 .34 .35), and
+    counting every rise doubled the points on the busiest accounts."""
     try:
         fh = limits["five_hour"]
         util, reset = float(fh["utilization"]), float(fh["reset"])
     except (KeyError, TypeError, ValueError):
         return
     st = STEP.get(acct)
-    if not st or st[0] != reset or util < st[1]:
-        STEP[acct] = [reset, util, 0.0]
+    if not st or st[0] != reset:
+        STEP[acct] = [reset, util, 0.0]      # a new window starts over
         return
     st[2] += dollars(model, usage) if usage else 0.0
     if util > st[1]:
