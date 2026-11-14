@@ -29,6 +29,7 @@ sys.path.insert(0, str(HERE))
 FAILURES = []
 SPENT = set()        # token substrings that are "out of quota"
 OVERLOAD = set()     # token substrings that 429 WITHOUT a spent claim
+FLAKY = {}           # token substring -> how many more times it 429s, then not
 FULL = set()         # token substrings that succeed but report 100% used
 SEEN = []            # tokens the upstream actually received, in order
 CONNS = []           # one entry per upstream TCP connection accepted
@@ -76,6 +77,10 @@ class Upstream(http.server.BaseHTTPRequestHandler):
 
         spent = any(f in auth for f in SPENT)
         overload = any(f in auth for f in OVERLOAD)
+        for f, left in list(FLAKY.items()):
+            if f in auth and left > 0:
+                FLAKY[f] = left - 1
+                overload = True
         longwait = any(f in auth for f in LONGWAIT)
         full = any(f in auth for f in FULL)
         hdrs = {
@@ -154,6 +159,7 @@ def main():
     os.environ["CCPOOL_UPSTREAM"] = f"http://127.0.0.1:{up.server_port}"
     import ccpool as C
     import ccpool_proxy as P
+    P.BACKOFF = (0.01, 0.01, 0.01)
     C.HOME, C.VAULT, C.STATE = home, home / "vault.json", home / "state.json"
     C.write_atomic(C.VAULT, {"accounts": {
         "one": {"token": "tok-one"}, "two": {"token": "tok-two"},
@@ -338,6 +344,13 @@ def main():
 
         print("\nA throttled conversation moves once, and back if that did not help")
         fresh()
+        P.PINS["blip/"] = ("one", time.time())
+        FLAKY["tok-one"] = 2
+        status, _ = post(port, session="blip")
+        check("a throttle that clears is served on the same account, no move",
+              status == 200 and SEEN == ["Bearer tok-one"] * 3
+              and P.PINS["blip/"][0] == "one", SEEN)
+        FLAKY.clear(); SEEN.clear()
         P.PINS["heavy/"] = ("one", time.time())
         OVERLOAD.add("tok-one")
         SEEN.clear()
@@ -355,7 +368,9 @@ def main():
         status, body = post(port, session="stuck")
         check("throttled everywhere: the same 429", status == 429
               and "not account quota" in body, f"{status} {body[:160]}")
-        check("after one move, not a walk of the whole pool", len(SEEN) == 2, SEEN)
+        check("retried here with backoff, then one move, not a walk of the pool",
+              SEEN == ["Bearer tok-one"] * 4 + [SEEN[-1]]
+              and SEEN[-1] != "Bearer tok-one", SEEN)
         check("and it is pinned back where its cache is",
               P.PINS.get("stuck/", ("?",))[0] == "one", P.PINS)
         fresh()

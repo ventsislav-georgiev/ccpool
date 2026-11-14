@@ -79,6 +79,7 @@ PINS: dict[str, tuple[str, float]] = {}
 UTIL: dict[str, float] = {}   # account -> five_hour utilization last reported
 PIN_IDLE = 3600     # the longest prompt-cache TTL: after that there is nothing to keep
 FULLISH = 0.9       # a new session placed here would only have to move again soon
+BACKOFF = (1, 2, 4)  # seconds between same-account retries of a throttled request
 
 
 def conversation(headers) -> str | None:
@@ -319,8 +320,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         tried: set[str] = set()
         key = conversation(self.headers)
         moved, back = False, None
+        waits, throttles = list(BACKOFF), 0
 
-        for _ in range(max(1, len(C.accounts()))):
+        for _ in range(max(1, len(C.accounts())) + len(BACKOFF)):
             with LOCK:
                 name = choose(key, model, tried)
             if name is None:
@@ -380,12 +382,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.note(f"{name} out on {','.join(sorted(spent))} -- "
                               f"rotating to another account and retrying request")
                     continue
-                # No spent claim: a throughput limit. Nothing is benched, but the
-                # conversation that hit it moves to the least busy account and
-                # stays there. Once per request only: a second account refusing
-                # too means the limit is not this account's (one conversation
-                # was refused by all 8 in 2s), and walking the pool would turn
-                # each client retry into one upstream call per account.
+                # No spent claim: a throughput limit. Nothing is benched. First
+                # retry right here with backoff -- the cache is here, and the
+                # callers seen hitting this (one-shot sessions) never retried
+                # themselves. Then move the conversation once to the least busy
+                # account. Once only: a second account refusing too means the
+                # limit is not this account's (one conversation was refused by
+                # all 8 in 2s), and walking the pool would turn each client
+                # retry into one upstream call per account.
+                throttles += 1
+                if waits and not moved:
+                    step = waits.pop(0)
+                    delay = wait if 0 < wait <= 10 else step
+                    self.note(f"{name}: throttled -- retrying "
+                              f"{(key or 'request')[:8]} here in {delay}s")
+                    time.sleep(delay)
+                    tried.discard(name)
+                    continue
                 if key and not moved:
                     with LOCK:
                         back = PINS.get(key, (None, 0))[0]
@@ -407,6 +420,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Retire before streaming, not after: the body can take a minute to
             # drain, and a request arriving in that window would otherwise pick
             # an account already known to be empty.
+            if throttles:
+                self.note(f"{name}: served {(key or 'request')[:8]} after "
+                          f"{throttles} throttled attempt(s)")
             self.retire_if_full(name, limits)
             self.stream_down(status, headers, resp, conn, name, {
                 "acct": name, "model": model, "conv": key, "path": self.path,
