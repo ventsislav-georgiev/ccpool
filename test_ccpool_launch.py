@@ -90,6 +90,13 @@ def statusline(env, base, target=None):
     return re.sub(r"\x1b\[[0-9;]*m", "", r.stdout), r.stderr
 
 
+def restart(env, port):
+    r = subprocess.run([sys.executable, str(HERE / "ccpool.py"), "restart",
+                        "--port", str(port)],
+                       env=env, capture_output=True, text=True, timeout=30)
+    return r.returncode, r.stdout, r.stderr
+
+
 def proxies(port):
     r = subprocess.run(["pgrep", "-f", f"ccpool.py proxy --port {port}$"],
                        capture_output=True, text=True)
@@ -173,6 +180,26 @@ def main():
                          target=f"http://127.0.0.1:{port}")
         check("headroom in front of ccpool: names the active account",
               seg == ("ccpool one", ""), seg)
+
+        print("\nRestart: a fresh proxy replaces the old one on the same port")
+        was = P.probe(port)["pid"]
+        rc, so, se = restart(env, port)
+        now = (P.probe(port) or {}).get("pid")
+        check("exits 0", rc == 0, f"{rc} {se}")
+        check("a new pid answers", now and now != was, (was, now))
+        check("exactly one proxy is left on the port", len(proxies(port)) == 1,
+              proxies(port))
+
+        print("\nRestart with nothing up: starts one")
+        down = free_port()
+        rc, so, se = restart(env, down)
+        check("exits 0 and it answers", rc == 0 and P.probe(down), f"{rc} {se}")
+        for pid in proxies(down):
+            os.kill(int(pid), signal.SIGTERM)
+
+        print("\nRestart on a port held by something else: left alone")
+        rc, so, se = restart(env, other.server_port)
+        check("exits 2 naming it", rc == 2 and "ccpool-proxy" in se, f"{rc} {se}")
 
         print("\nTwo launches at once: one proxy serves both")
         before = len(ran(out))

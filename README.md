@@ -74,8 +74,9 @@ It runs on every status refresh, so give it an interpreter that starts fast: a
 pyenv shim adds about 0.3s, `/usr/bin/python3 ~/.local/bin/ccpool statusline`
 does not.
 
-Other commands: `status` (probe real quota, costs one call per account), `hold`
-(pull an account out of rotation), `clear` (undo a bench), `rm`.
+Other commands: `restart` (fresh proxy on the same port, so it runs current
+code; open sessions carry on), `status` (probe real quota, costs one call per
+account), `hold` (pull an account out of rotation), `clear` (undo a bench), `rm`.
 
 ## How the proxy places sessions
 

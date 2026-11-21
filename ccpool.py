@@ -39,6 +39,7 @@ import argparse
 import contextlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -698,6 +699,55 @@ def cmd_launch(args) -> int:
         return 127
 
 
+def cmd_restart(args) -> int:
+    """Stop the proxy on the port and bring a fresh one up, so it runs current
+    code. Open sessions keep their ANTHROPIC_BASE_URL and carry on; only a
+    request in flight at that moment is cut.
+
+    A supervisor that respawns the proxy (a shell loop, launchd) is left to do
+    so: after the old one dies there is a short grace before starting one here,
+    so the two never race for the port and starve the supervisor out.
+    """
+    import ccpool_proxy as P
+    try:
+        running = P.probe(args.port)
+    except OSError as e:
+        print(f"ccpool: {e}; not touching it.", file=sys.stderr)
+        return 2
+    old = (running or {}).get("pid")
+    if running is not None and not old:
+        print(f"ccpool: the proxy on port {args.port} is too old to name its pid;"
+              " stop it by hand.", file=sys.stderr)
+        return 2
+    if old:
+        try:
+            os.kill(old, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline, gone = time.monotonic() + 10, None
+        while time.monotonic() < deadline:
+            try:
+                pid = (P.probe(args.port, timeout=1) or {}).get("pid")
+            except OSError:
+                pid = old           # busy or mid-shutdown: not gone yet
+            if pid and pid != old:
+                print(f"ccpool: proxy restarted on {args.port} (pid {pid})",
+                      file=sys.stderr)
+                return 0
+            if pid is None:
+                gone = gone or time.monotonic()
+                if time.monotonic() - gone > 3:
+                    break
+            time.sleep(0.1)
+        else:
+            print(f"ccpool: pid {old} did not stop", file=sys.stderr)
+            return 1
+    if not start_proxy(args.port):
+        return 1
+    print(f"ccpool: proxy up on {args.port}", file=sys.stderr)
+    return 0
+
+
 def start_proxy(port: int) -> bool:
     """Start `ccpool proxy` in a session of its own and wait until it answers.
 
@@ -784,6 +834,10 @@ def main(argv=None) -> int:
     p.add_argument("--port", type=int, default=PORT)
     p.add_argument("rest", nargs=argparse.REMAINDER, metavar="[TOOL] [-- ARGS]")
     p.set_defaults(fn=cmd_launch)
+
+    p = sub.add_parser("restart", help="stop the proxy and start a fresh one")
+    p.add_argument("--port", type=int, default=PORT)
+    p.set_defaults(fn=cmd_restart)
 
     p = sub.add_parser("statusline", help="status-line segment: is this session "
                                           "going through the proxy")
